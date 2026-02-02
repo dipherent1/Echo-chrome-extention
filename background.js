@@ -1,107 +1,178 @@
-// Global State
+// --- CONFIGURATION ---
+const IDLE_THRESHOLD = 60; // Seconds
+const MIN_DURATION = 5; // Ignore visits shorter than this
+const SYNC_INTERVAL = 5; // Minutes between API syncs
+
+// --- STATE ---
 let currentTabId = null;
-let currentUrl = null;
+let currentUrl = "";
 let startTime = Date.now();
+// We store metadata here so we can attach it to the log when the user *leaves* the page
+let currentMetadata = { title: "", description: "" };
 
-const IDLE_THRESHOLD = 60; // Seconds until considered "Idle"
-
-// Initialize Idle Detection
 chrome.idle.setDetectionInterval(IDLE_THRESHOLD);
 
-// --- CORE FUNCTIONS ---
+// --- 1. THE SCRAPER (Runs inside the webpage) ---
+function scrapePageContext() {
+  try {
+    const getMeta = (name) => {
+      const element = document.querySelector(`meta[name="${name}"]`);
+      return element ? element.content : "";
+    };
+    return {
+      title: document.title || window.location.hostname,
+      description: getMeta("description") || getMeta("og:description") || "",
+    };
+  } catch (e) {
+    return { title: "", description: "" };
+  }
+}
 
-// 1. Commit the log to storage
-async function logSession() {
+// --- 2. CORE LOGIC ---
+
+async function handleTabChange(newTabId) {
   const now = Date.now();
-  const duration = (now - startTime) / 1000; // in seconds
+  const duration = (now - startTime) / 1000; // Seconds
 
-  // Filter: Ignore short visits (< 1s) or system pages (chrome://)
-  if (currentUrl && duration > 1 && currentUrl.startsWith("http")) {
-    const newLog = {
+  // A. LOG PREVIOUS SESSION
+  // Only save if it was a real URL and lasted longer than threshold
+  if (currentUrl && duration > MIN_DURATION && currentUrl.startsWith("http")) {
+    const logEntry = {
       url: currentUrl,
       domain: new URL(currentUrl).hostname,
+      title: currentMetadata.title, // From previous scrape
+      description: currentMetadata.description, // From previous scrape
       startTime: startTime,
       endTime: now,
       duration: Math.round(duration),
-      date: new Date().toISOString(),
+      timestamp: new Date().toISOString(),
     };
 
-    // Save to local storage
-    const data = await chrome.storage.local.get("activityLogs");
-    const logs = data.activityLogs || [];
-    logs.push(newLog);
-    await chrome.storage.local.set({ activityLogs: logs });
-
-    console.log("Logged:", newLog); // View this in Service Worker Console
+    await saveToBuffer(logEntry);
   }
 
-  // Reset Timer
+  // B. PREPARE NEW SESSION
   startTime = now;
-}
-
-// 2. Update State
-async function updateState(tabId) {
-  // Log the *previous* session before switching
-  await logSession();
+  currentMetadata = { title: "", description: "" }; // Reset
 
   try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab.active) {
+    const tab = await chrome.tabs.get(newTabId);
+
+    if (tab.active && tab.url.startsWith("http")) {
       currentUrl = tab.url;
-      currentTabId = tabId;
+      currentTabId = newTabId;
+
+      // C. SCRAPE NEW PAGE (Knowledge Base)
+      try {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: newTabId },
+          func: scrapePageContext,
+        });
+
+        if (results && results[0] && results[0].result) {
+          currentMetadata = results[0].result;
+          console.log("Captured Context:", currentMetadata.title);
+        }
+      } catch (err) {
+        // Fails on restricted pages (chrome://, webstore, etc.)
+        currentMetadata = { title: tab.title, description: "" };
+      }
+    } else {
+      currentUrl = "";
     }
-  } catch (err) {
-    // Tab might be closed or restricted
-    currentUrl = null;
+  } catch (e) {
+    currentUrl = "";
   }
 }
 
-// --- EVENT LISTENERS ---
+async function saveToBuffer(log) {
+  const data = await chrome.storage.local.get("logs");
+  const logs = data.logs || [];
+  logs.push(log);
+  await chrome.storage.local.set({ logs });
+  console.log("Buffered Log:", log);
+}
 
-// A. Tab Switched
+// --- 3. LISTENERS ---
+
+// Tab Switch
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
-  await updateState(activeInfo.tabId);
+  await handleTabChange(activeInfo.tabId);
 });
 
-// B. URL Changed (Navigation)
+// URL Change (same tab)
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
   if (changeInfo.status === "complete" && tab.active) {
-    await updateState(tabId);
+    await handleTabChange(tabId);
   }
 });
 
-// C. Window Focus Changed (User minimizes Chrome)
+// Window Focus (Stop timer if minimized)
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    // Chrome is no longer focused -> Log and stop tracking
-    await logSession();
-    currentUrl = null; // Stop tracking
+    // User left Chrome
+    await handleTabChange(null); // Just saves pending log
   } else {
-    // Chrome is back in focus -> Find active tab
+    // User came back
     const tabs = await chrome.tabs.query({
       active: true,
       lastFocusedWindow: true,
     });
     if (tabs.length > 0) {
-      await updateState(tabs[0].id);
+      startTime = Date.now(); // Reset timer to NOW
+      await handleTabChange(tabs[0].id);
     }
   }
 });
 
-// D. Idle Detection (User walks away)
-chrome.idle.onStateChanged.addListener(async (newState) => {
-  console.log("User State:", newState);
-  if (newState === "idle" || newState === "locked") {
-    // User is gone -> Log the session up to this point
-    await logSession();
-    currentUrl = null; // Pause tracking
-  } else if (newState === "active") {
-    // User returned -> Restart tracking on current tab
+// Idle (User walked away)
+chrome.idle.onStateChanged.addListener(async (state) => {
+  if (state === "idle" || state === "locked") {
+    await handleTabChange(null); // Save pending log
+  } else if (state === "active") {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tabs.length > 0) {
-      // Reset start time to NOW (don't count the idle time)
       startTime = Date.now();
-      currentUrl = tabs[0].url;
+      await handleTabChange(tabs[0].id);
+    }
+  }
+});
+
+// --- 4. SERVER SYNC (The "Productivity Hawk" Part) ---
+chrome.alarms.create("syncData", { periodInMinutes: SYNC_INTERVAL });
+
+chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name === "syncData") {
+    const data = await chrome.storage.local.get(["logs", "apiKey"]);
+    const logs = data.logs || [];
+    const apiKey = data.apiKey;
+
+    if (logs.length === 0) return; // Nothing to sync
+
+    if (!apiKey) {
+      console.warn("No API Key found. Logs accumulating locally.");
+      return;
+    }
+
+    try {
+      // Send to your Next.js API
+      const response = await fetch("http://localhost:3000/api/log", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(logs),
+      });
+
+      if (response.ok) {
+        console.log(`Synced ${logs.length} logs to cloud.`);
+        await chrome.storage.local.set({ logs: [] }); // Clear buffer
+      } else {
+        console.error("Server rejected logs:", response.status);
+      }
+    } catch (error) {
+      console.error("Sync failed (Server offline?):", error);
     }
   }
 });
