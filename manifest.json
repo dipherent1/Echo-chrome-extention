@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Productivity Hawk & Knowledge Base",
+  "version": "2.0",
+  "permissions": ["tabs", "storage", "idle", "alarms", "scripting"],
+  "host_permissions": ["http://localhost:3000/*", "<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html"
+  }
+}

@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body { width: 300px; font-family: sans-serif; padding: 10px; }
+    h2 { font-size: 16px; margin-bottom: 10px; }
+    #log-container { 
+      max-height: 400px; 
+      overflow-y: auto; 
+      border: 1px solid #ddd;
+      font-size: 12px;
+    }
+    .log-item {
+      padding: 5px;
+      border-bottom: 1px solid #eee;
+    }
+    .domain { font-weight: bold; color: #333; }
+    .time { color: #666; font-size: 11px; }
+    button { width: 100%; margin-top: 10px; padding: 5px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>Local Activity Logs</h2>
+  <div id="log-container"></div>
+  <button id="clearBtn">Clear Logs</button>
+  <script src="popup.js"></script>
+</body>
+</html>
