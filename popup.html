@@ -1,85 +1,160 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
-    <style>
-      body {
-        width: 320px;
-        font-family: -apple-system, system-ui, sans-serif;
-        padding: 12px;
-      }
-      h3 {
-        margin: 0 0 10px 0;
-        font-size: 14px;
-      }
-
-      /* Input Area */
-      .config {
-        margin-bottom: 10px;
-        border-bottom: 1px solid #eee;
-        padding-bottom: 10px;
-      }
-      input {
-        width: 70%;
-        padding: 5px;
-        border: 1px solid #ccc;
-        border-radius: 4px;
-      }
-      button#save {
-        width: 25%;
-        padding: 5px;
-        cursor: pointer;
-        background: #000;
-        color: #fff;
-        border: none;
-        border-radius: 4px;
-      }
-
-      /* Logs Area */
-      #log-container {
-        max-height: 300px;
-        overflow-y: auto;
-        border: 1px solid #eee;
-        border-radius: 4px;
-        margin-bottom: 8px;
-      }
-      .log-item {
-        padding: 8px;
-        border-bottom: 1px solid #f5f5f5;
-      }
-      .domain {
-        font-weight: 600;
-        font-size: 12px;
-        color: #333;
-        margin-bottom: 2px;
-      }
-      .time {
-        color: #888;
-        font-size: 11px;
-      }
-
-      /* Footer */
-      #clearBtn {
-        width: 100%;
-        padding: 6px;
-        background: #f0f0f0;
-        border: none;
-        border-radius: 4px;
-        cursor: pointer;
-      }
-      #clearBtn:hover {
-        background: #e0e0e0;
-      }
-    </style>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Echo - The Logger</title>
+    <link rel="stylesheet" href="popup.css" />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
   </head>
   <body>
-    <div class="config">
-      <input type="text" id="apiKey" placeholder="Bearer Token" />
-      <button id="save">Save</button>
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <div class="brand-icon">📡</div>
+        <span class="brand-name">Echo</span>
+        <span class="brand-version" id="version">v2.1.0</span>
+      </div>
+      <div class="status-indicator" id="statusIndicator">
+        <div class="status-dot checking" id="statusDot"></div>
+        <span id="statusText">Checking...</span>
+      </div>
+    </header>
+
+    <!-- Tab Navigation -->
+    <nav class="tab-nav">
+      <button class="tab-btn active" data-tab="activity">📊 Activity</button>
+      <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
+    </nav>
+
+    <!-- Activity Tab -->
+    <div class="tab-content active" id="activity-tab">
+      <!-- API Key Config -->
+      <section class="config-section">
+        <div class="input-group">
+          <div class="input-wrapper">
+            <input
+              type="password"
+              id="apiKey"
+              class="api-input"
+              placeholder="Enter your API key..."
+              autocomplete="off"
+            />
+            <button
+              class="toggle-visibility"
+              id="toggleVisibility"
+              title="Toggle visibility"
+            >
+              👁
+            </button>
+          </div>
+          <button class="btn btn-primary" id="saveBtn">Save</button>
+        </div>
+      </section>
+
+      <!-- Stats Bar -->
+      <div class="stats-bar">
+        <div class="stat-item">
+          <span>Buffer:</span>
+          <span class="stat-value" id="bufferCount">0</span>
+        </div>
+        <div class="stat-item">
+          <span>Network:</span>
+          <span class="stat-value" id="networkStatus">--</span>
+        </div>
+      </div>
+
+      <!-- Logs Section -->
+      <section class="logs-section">
+        <div class="logs-header">
+          <span class="logs-title">Buffered Activity</span>
+          <span class="logs-count" id="logsCount">0 items</span>
+        </div>
+        <div class="log-container" id="logContainer">
+          <!-- Logs will be rendered here -->
+        </div>
+      </section>
+
+      <!-- Footer Actions -->
+      <footer class="footer">
+        <button class="btn btn-sync" id="syncBtn">
+          <span id="syncBtnText">⚡ Force Sync</span>
+        </button>
+        <button class="btn btn-clear" id="clearBtn">🗑 Clear</button>
+      </footer>
     </div>
 
-    <h3>Buffered Logs</h3>
-    <div id="log-container"></div>
-    <button id="clearBtn">Clear Buffer</button>
+    <!-- Settings Tab -->
+    <div class="tab-content" id="settings-tab">
+      <!-- Blocked Domains Section -->
+      <section class="settings-section">
+        <div class="settings-header">
+          <h3 class="settings-title">🚫 Blocked Domains</h3>
+          <span class="settings-subtitle"
+            >Sites that will never be tracked</span
+          >
+        </div>
+        <div class="tag-input-container">
+          <div class="tag-list" id="blockedDomainsList">
+            <!-- Tags rendered here -->
+          </div>
+          <div class="input-group">
+            <input
+              type="text"
+              id="newBlockedDomain"
+              class="settings-input"
+              placeholder="e.g., facebook.com"
+            />
+            <button class="btn btn-primary btn-sm" id="addBlockedDomainBtn">
+              + Add
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Sensitive Params Section -->
+      <section class="settings-section">
+        <div class="settings-header">
+          <h3 class="settings-title">🔒 Sensitive URL Parameters</h3>
+          <span class="settings-subtitle">Parameters to redact from URLs</span>
+        </div>
+        <div class="tag-input-container">
+          <div class="tag-list" id="sensitiveParamsList">
+            <!-- Tags rendered here -->
+          </div>
+          <div class="input-group">
+            <input
+              type="text"
+              id="newSensitiveParam"
+              class="settings-input"
+              placeholder="e.g., api_secret"
+            />
+            <button class="btn btn-primary btn-sm" id="addSensitiveParamBtn">
+              + Add
+            </button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Reset Section -->
+      <section class="settings-section settings-danger">
+        <div class="settings-header">
+          <h3 class="settings-title">⚠️ Reset Custom Settings</h3>
+          <span class="settings-subtitle"
+            >Clear all custom blocked domains and params</span
+          >
+        </div>
+        <button class="btn btn-danger" id="resetSettingsBtn">
+          Reset to Defaults
+        </button>
+      </section>
+    </div>
+
+    <!-- Toast Notification -->
+    <div class="toast" id="toast"></div>
 
     <script src="popup.js"></script>
   </body>

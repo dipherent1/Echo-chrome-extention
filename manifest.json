@@ -1,13 +1,41 @@
 {
   "manifest_version": 3,
-  "name": "Productivity Hawk & Knowledge Base",
-  "version": "2.0",
-  "permissions": ["tabs", "storage", "idle", "alarms", "scripting"],
-  "host_permissions": ["http://localhost:3000/*", "<all_urls>"],
+  "name": "Echo - The Logger",
+  "description": "Intelligent browsing analytics and knowledge capture. Track your productivity and build your personal knowledge base.",
+  "version": "2.1.0",
+
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "storage",
+    "unlimitedStorage",
+    "idle",
+    "alarms",
+    "scripting"
+  ],
+
+  "host_permissions": ["<all_urls>"],
+
   "background": {
-    "service_worker": "background.js"
+    "service_worker": "background.js",
+    "type": "module"
   },
+
   "action": {
-    "default_popup": "popup.html"
+    "default_popup": "popup.html",
+    "default_title": "Echo - The Logger",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
   }
 }
