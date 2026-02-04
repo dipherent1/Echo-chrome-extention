@@ -314,3 +314,27 @@ export async function refreshBadge() {
   const logs = await getLogsFromStorage();
   await updateBadge(logs.length);
 }
+
+// ============================================
+// CLIENT ID UTILITIES
+// ============================================
+
+/**
+ * Get or create a unique client ID
+ * @returns {Promise<string>}
+ */
+export async function getClientId() {
+  const data = await chrome.storage.local.get("clientId");
+  if (data.clientId) {
+    return data.clientId;
+  }
+
+  // Generate new UUID-like ID
+  const newId =
+    "client_" +
+    Math.random().toString(36).substr(2, 9) +
+    "_" +
+    Date.now().toString(36);
+  await chrome.storage.local.set({ clientId: newId });
+  return newId;
+}

@@ -30,6 +30,7 @@ import {
   calculateBackoff,
   refreshBadge,
   loadCustomSettings,
+  getClientId,
 } from "./utils.js";
 
 // ============================================
@@ -303,41 +304,81 @@ async function syncLogs(retryAttempt = 0) {
   logger.group("Sync Operation");
   logger.time("sync");
 
-  try {
-    const response = await fetch(`${API_URL}/api/log`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+  const clientId = await getClientId();
+  const successfulIndices = [];
+  let abortSync = false;
+
+  for (let i = 0; i < logs.length; i++) {
+    if (abortSync) break;
+
+    const log = logs[i];
+
+    // Transform to production schema
+    const payload = {
+      url: log.url,
+      title: log.title || "Untitled",
+      duration: log.duration,
+      timestamp: log.timestamp || new Date(log.startTime).toISOString(),
+      description: log.description || "",
+      source: {
+        type: "chrome-extension",
+        deviceName: "Chrome Extension",
+        clientId: clientId,
       },
-      body: JSON.stringify(logs),
-    });
+    };
 
-    if (response.ok) {
-      // Success - clear buffer
-      await saveLogsToStorage([]);
-      await refreshBadge();
-      syncRetryCount = 0;
+    try {
+      const response = await fetch(`${API_URL}/api/log`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify(payload),
+      });
 
-      logger.info("Sync successful", { count: logs.length });
-    } else if (response.status === 429) {
-      // Rate limited - exponential backoff
+      if (response.ok) {
+        successfulIndices.push(i);
+        logger.debug("Synced log", { title: payload.title });
+        syncRetryCount = 0; // Reset retry on success
+      } else if (response.status === 429 || response.status >= 500) {
+        // Temporary failure - stop syncing and retry later
+        logger.warn("Sync paused (server issue)", { status: response.status });
+        scheduleRetry(retryAttempt);
+        abortSync = true;
+      } else {
+        // Permanent failure (400/401) - log error but don't retry this item
+        // We'll treat it as "handled" so it gets removed from buffer to prevent clogging
+        logger.error("Log rejected", {
+          status: response.status,
+          url: payload.url,
+        });
+        errorCount++;
+        successfulIndices.push(i); // Remove bad logs to clear queue
+      }
+    } catch (error) {
+      // Network error - stop syncing
+      logger.error("Sync failed", { error: error.message });
       scheduleRetry(retryAttempt);
-      logger.warn("Rate limited", { status: response.status });
-    } else if (response.status >= 500) {
-      // Server error - exponential backoff
-      scheduleRetry(retryAttempt);
-      logger.warn("Server error", { status: response.status });
-    } else {
-      // Client error (4xx except 429) - don't retry
-      logger.error("Sync rejected", { status: response.status });
+      abortSync = true;
       errorCount++;
     }
-  } catch (error) {
-    // Network error - schedule retry
-    scheduleRetry(retryAttempt);
-    logger.error("Sync failed", { error: error.message });
-    errorCount++;
+  }
+
+  // Remove successful logs from buffer
+  if (successfulIndices.length > 0) {
+    // We need to be careful removing items by index from an array we iterated
+    // best way is to keep items that were NOT successful
+    const successfulSet = new Set(successfulIndices);
+    const remainingLogs = logs.filter((_, index) => !successfulSet.has(index));
+
+    await saveLogsToStorage(remainingLogs);
+    await refreshBadge();
+
+    logger.info("Sync batch completed", {
+      synced: successfulIndices.length,
+      remaining: remainingLogs.length,
+    });
   }
 
   logger.timeEnd("sync");
