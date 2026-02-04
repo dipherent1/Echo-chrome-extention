@@ -9,7 +9,7 @@ const ENV = "development";
 // --- API Configuration ---
 const API_CONFIG = {
   development: "http://localhost:3000",
-  production: "https://your-production-api.com", // TODO: Replace with actual prod URL
+  production: "https://v0-personal-productivity-tracker-kd.vercel.app/", // TODO: Replace with actual prod URL
 };
 
 export const API_URL = API_CONFIG[ENV];
@@ -17,7 +17,7 @@ export const API_URL = API_CONFIG[ENV];
 // --- Timing Constants ---
 export const IDLE_THRESHOLD = 60; // Seconds before user considered idle
 export const MIN_DURATION = 5; // Ignore visits shorter than this (seconds)
-export const SYNC_INTERVAL = 5; // Minutes between API syncs
+export const SYNC_INTERVAL = 1; // Minutes between API syncs
 export const DEBOUNCE_MS = 500; // Debounce rapid tab switches
 export const HEALTH_PING_INTERVAL = 1440; // 24 hours in minutes
 
