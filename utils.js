@@ -261,20 +261,28 @@ export async function appendLogToStorage(log) {
       const existing = logs[idx];
 
       // Sum durations
-      existing.duration = (Number(existing.duration) || 0) + (Number(log.duration) || 0);
+      existing.duration =
+        (Number(existing.duration) || 0) + (Number(log.duration) || 0);
 
       // Preserve earliest startTime and latest endTime
-      if (log.startTime && (!existing.startTime || log.startTime < existing.startTime)) {
+      if (
+        log.startTime &&
+        (!existing.startTime || log.startTime < existing.startTime)
+      ) {
         existing.startTime = log.startTime;
       }
-      if (log.endTime && (!existing.endTime || log.endTime > existing.endTime)) {
+      if (
+        log.endTime &&
+        (!existing.endTime || log.endTime > existing.endTime)
+      ) {
         existing.endTime = log.endTime;
       }
 
       // Update timestamp to now and prefer more descriptive title/description
       existing.timestamp = new Date().toISOString();
       if (!existing.title && log.title) existing.title = log.title;
-      if (!existing.description && log.description) existing.description = log.description;
+      if (!existing.description && log.description)
+        existing.description = log.description;
 
       logs[idx] = existing;
     } else {
