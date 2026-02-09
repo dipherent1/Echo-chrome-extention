@@ -9,15 +9,15 @@ const ENV = "production";
 // --- API Configuration ---
 const API_CONFIG = {
   development: "http://localhost:3000",
-  production: "https://v0-personal-productivity-tracker-kd.vercel.app/", // TODO: Replace with actual prod URL
+  production: "https://v0-personal-productivity-tracker-kd.vercel.app", // TODO: Replace with actual prod URL
 };
 
 export const API_URL = API_CONFIG[ENV];
 
 // --- Timing Constants ---
-export const IDLE_THRESHOLD = 60; // Seconds before user considered idle
+export const IDLE_THRESHOLD = 150; // Seconds before user considered idle
 export const MIN_DURATION = 5; // Ignore visits shorter than this (seconds)
-export const SYNC_INTERVAL = 1; // Minutes between API syncs
+export const SYNC_INTERVAL = 15; // Minutes between API syncs
 export const DEBOUNCE_MS = 500; // Debounce rapid tab switches
 export const HEALTH_PING_INTERVAL = 1440; // 24 hours in minutes
 
@@ -26,43 +26,7 @@ export const STORAGE_QUOTA_MB = 4; // Trigger purge at this limit
 export const PURGE_PERCENTAGE = 0.1; // Remove 10% of oldest logs on purge
 
 // --- Domain Blacklist (Never track these) ---
-export const BLACKLISTED_DOMAINS = [
-  // Banking & Finance
-  "chase.com",
-  "bankofamerica.com",
-  "wellsfargo.com",
-  "paypal.com",
-  "venmo.com",
-  "capitalone.com",
-  "americanexpress.com",
-  "discover.com",
-  "citibank.com",
-  "usbank.com",
-  "tdbank.com",
-  "pnc.com",
-  "ally.com",
-  "schwab.com",
-  "fidelity.com",
-  "vanguard.com",
-  "robinhood.com",
-  "coinbase.com",
-  "binance.com",
-  "kraken.com",
-
-  // Healthcare
-  "myhealthevet.va.gov",
-  "mychart.com",
-
-  // Local Development
-  "localhost",
-  "127.0.0.1",
-  "0.0.0.0",
-
-  // Browser Internal
-  "chrome.google.com",
-  "addons.mozilla.org",
-  "microsoftedge.microsoft.com",
-];
+export const BLACKLISTED_DOMAINS = [];
 
 // --- Sensitive URL Parameters (Will be redacted) ---
 export const SENSITIVE_PARAMS = [
