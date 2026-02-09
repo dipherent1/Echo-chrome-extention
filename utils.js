@@ -252,9 +252,44 @@ export async function saveLogsToStorage(logs) {
  */
 export async function appendLogToStorage(log) {
   const logs = await getLogsFromStorage();
-  logs.push(log);
-  await saveLogsToStorage(logs);
-  return logs.length;
+
+  try {
+    // If an entry for the same URL already exists in the buffer, merge durations
+    const idx = logs.findIndex((l) => l.url === log.url);
+
+    if (idx !== -1) {
+      const existing = logs[idx];
+
+      // Sum durations
+      existing.duration = (Number(existing.duration) || 0) + (Number(log.duration) || 0);
+
+      // Preserve earliest startTime and latest endTime
+      if (log.startTime && (!existing.startTime || log.startTime < existing.startTime)) {
+        existing.startTime = log.startTime;
+      }
+      if (log.endTime && (!existing.endTime || log.endTime > existing.endTime)) {
+        existing.endTime = log.endTime;
+      }
+
+      // Update timestamp to now and prefer more descriptive title/description
+      existing.timestamp = new Date().toISOString();
+      if (!existing.title && log.title) existing.title = log.title;
+      if (!existing.description && log.description) existing.description = log.description;
+
+      logs[idx] = existing;
+    } else {
+      logs.push(log);
+    }
+
+    await saveLogsToStorage(logs);
+    return logs.length;
+  } catch (e) {
+    logger.error("Failed to append or merge log", { error: e.message });
+    // Fallback: try to push and save the log
+    logs.push(log);
+    await saveLogsToStorage(logs);
+    return logs.length;
+  }
 }
 
 /**
