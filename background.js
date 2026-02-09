@@ -40,6 +40,7 @@ let currentTabId = null;
 let currentUrl = "";
 let lastActiveTime = Date.now();
 let currentMetadata = { title: "", description: "" };
+let isSyncing = false; // Prevent concurrent syncs
 let syncRetryCount = 0;
 let errorCount = 0;
 
@@ -106,14 +107,47 @@ async function handleTabChange(newTabId) {
   }
 
   // Check if we are still on the same URL (e.g. spurious onUpdated event)
-  if (
-    newTabId &&
-    currentTabId === newTabId &&
-    newTab &&
-    newTab.url === currentUrl
-  ) {
+  let isSameSession = false;
+  if (newTabId && currentTabId === newTabId && newTab) {
+    if (newTab.url === currentUrl) {
+      isSameSession = true;
+    } else if (
+      currentUrl &&
+      currentUrl.includes("youtube.com/watch") &&
+      newTab.url.includes("youtube.com/watch")
+    ) {
+      // Smart check for YouTube: same video ID means same session
+      try {
+        const u1 = new URL(currentUrl);
+        const u2 = new URL(newTab.url);
+        if (u1.searchParams.get("v") === u2.searchParams.get("v")) {
+          isSameSession = true;
+        }
+      } catch (e) {}
+    }
+  }
+
+  if (isSameSession) {
     // We can update metadata here if we want, but definitely do NOT reset the timer
-    logger.debug("Ignored duplicate tab update", { url: currentUrl });
+    logger.debug("Same session update - refreshing metadata", {
+      url: currentUrl,
+    });
+
+    // If the page has finished loading, try to grab better metadata (title/desc)
+    if (newTab && newTab.status === "complete") {
+      try {
+        const results = await chrome.scripting.executeScript({
+          target: { tabId: newTabId },
+          func: scrapePageContext,
+        });
+
+        if (results?.[0]?.result && results[0].result.title) {
+          currentMetadata = results[0].result;
+        }
+      } catch (err) {
+        /* ignore injection errors on same-session updates */
+      }
+    }
     return;
   }
 
@@ -244,8 +278,17 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 
 // Tab updated (URL changed in same tab)
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status === "complete" && tab.active) {
+  // Trigger if loading completes OR if URL changes (SPA navigation like YouTube)
+  if (tab.active && (changeInfo.status === "complete" || changeInfo.url)) {
     debouncedTabChange(tabId);
+  }
+});
+
+// Tab removed (closed)
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  if (tabId === currentTabId) {
+    // Pass null to signal that the active session has ended
+    handleTabChange(null);
   }
 });
 
@@ -272,8 +315,32 @@ chrome.idle.onStateChanged.addListener(async (state) => {
   logger.debug("Idle state changed", { state });
 
   if (state === "idle" || state === "locked") {
+    // Check if the current tab is playing audio (e.g. YouTube)
+    let isAudible = false;
+    if (currentTabId) {
+      try {
+        const tab = await chrome.tabs.get(currentTabId);
+        if (tab && tab.audible) {
+          isAudible = true;
+        }
+      } catch (e) {
+        /* ignore */
+      }
+    }
+
+    if (isAudible) {
+      logger.debug("User idle but media playing - keeping session alive");
+      return;
+    }
+
     await handleTabChange(null);
   } else if (state === "active") {
+    // If we're already tracking a valid session (e.g. continued through idle), don't reset
+    if (currentUrl && currentTabId) {
+      logger.debug("User active again - continuing session");
+      return;
+    }
+
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tabs.length > 0) {
       lastActiveTime = Date.now();
@@ -294,6 +361,19 @@ chrome.alarms.create("healthPing", { periodInMinutes: HEALTH_PING_INTERVAL });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === "syncData") {
+    // 1. Flush the current in-memory session to storage first!
+    // This allows long-running sessions (like videos) to be synced incrementally
+    await handleTabChange(null);
+
+    // 2. Restart tracking immediately for the active tab
+    // We do this BEFORE sync so we don't lose time
+    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (tabs.length > 0) {
+      lastActiveTime = Date.now();
+      handleTabChange(tabs[0].id);
+    }
+
+    // 3. Perform Sync
     await syncLogs();
   } else if (alarm.name === "healthPing") {
     await sendHealthPing();
@@ -311,6 +391,12 @@ async function syncLogs(retryAttempt = 0) {
     return;
   }
 
+  // Prevent concurrent syncs
+  if (isSyncing) {
+    logger.debug("Sync already in progress - skipping");
+    return;
+  }
+
   const data = await chrome.storage.local.get(["logs", "apiKey"]);
   const logs = data.logs || [];
   const apiKey = data.apiKey;
@@ -325,88 +411,98 @@ async function syncLogs(retryAttempt = 0) {
     return;
   }
 
-  logger.group("Sync Operation");
-  logger.time("sync");
+  try {
+    isSyncing = true;
+    logger.group("Sync Operation");
+    logger.time("sync");
 
-  const clientId = await getClientId();
-  const successfulIndices = [];
-  let abortSync = false;
+    const clientId = await getClientId();
+    const successfulIndices = [];
+    let abortSync = false;
 
-  for (let i = 0; i < logs.length; i++) {
-    if (abortSync) break;
+    for (let i = 0; i < logs.length; i++) {
+      if (abortSync) break;
 
-    const log = logs[i];
+      const log = logs[i];
 
-    // Transform to production schema
-    const payload = {
-      url: log.url,
-      title: log.title || "Untitled",
-      duration: log.duration,
-      timestamp: log.timestamp || new Date(log.startTime).toISOString(),
-      description: log.description || "",
-      source: {
-        type: "chrome-extension",
-        deviceName: "Chrome Extension",
-        clientId: clientId,
-      },
-    };
-
-    try {
-      const response = await fetch(`${API_URL}/api/log`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
+      // Transform to production schema
+      const payload = {
+        url: log.url,
+        title: log.title || "Untitled",
+        duration: log.duration,
+        timestamp: log.timestamp || new Date(log.startTime).toISOString(),
+        description: log.description || "",
+        source: {
+          type: "chrome-extension",
+          deviceName: "Chrome Extension",
+          clientId: clientId,
         },
-        body: JSON.stringify(payload),
-      });
+      };
 
-      if (response.ok) {
-        successfulIndices.push(i);
-        logger.debug("Synced log", { title: payload.title });
-        syncRetryCount = 0; // Reset retry on success
-      } else if (response.status === 429 || response.status >= 500) {
-        // Temporary failure - stop syncing and retry later
-        logger.warn("Sync paused (server issue)", { status: response.status });
+      try {
+        const response = await fetch(`${API_URL}/api/log`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${apiKey}`,
+          },
+          body: JSON.stringify(payload),
+        });
+
+        if (response.ok) {
+          successfulIndices.push(i);
+          logger.debug("Synced log", { title: payload.title });
+          syncRetryCount = 0; // Reset retry on success
+        } else if (response.status === 429 || response.status >= 500) {
+          // Temporary failure - stop syncing and retry later
+          logger.warn("Sync paused (server issue)", {
+            status: response.status,
+          });
+          scheduleRetry(retryAttempt);
+          abortSync = true;
+        } else {
+          // Permanent failure (400/401) - log error but don't retry this item
+          // We'll treat it as "handled" so it gets removed from buffer to prevent clogging
+          logger.error("Log rejected", {
+            status: response.status,
+            url: payload.url,
+          });
+          errorCount++;
+          successfulIndices.push(i); // Remove bad logs to clear queue
+        }
+      } catch (error) {
+        // Network error - stop syncing
+        logger.error("Sync failed", { error: error.message });
         scheduleRetry(retryAttempt);
         abortSync = true;
-      } else {
-        // Permanent failure (400/401) - log error but don't retry this item
-        // We'll treat it as "handled" so it gets removed from buffer to prevent clogging
-        logger.error("Log rejected", {
-          status: response.status,
-          url: payload.url,
-        });
         errorCount++;
-        successfulIndices.push(i); // Remove bad logs to clear queue
       }
-    } catch (error) {
-      // Network error - stop syncing
-      logger.error("Sync failed", { error: error.message });
-      scheduleRetry(retryAttempt);
-      abortSync = true;
-      errorCount++;
     }
+
+    // Remove successful logs from buffer
+    if (successfulIndices.length > 0) {
+      // We need to be careful removing items by index from an array we iterated
+      // best way is to keep items that were NOT successful
+      const successfulSet = new Set(successfulIndices);
+      const remainingLogs = logs.filter(
+        (_, index) => !successfulSet.has(index),
+      );
+
+      await saveLogsToStorage(remainingLogs);
+      await refreshBadge();
+
+      logger.info("Sync batch completed", {
+        synced: successfulIndices.length,
+        remaining: remainingLogs.length,
+      });
+    }
+  } catch (error) {
+    logger.error("Sync process failed", { error: error.message });
+  } finally {
+    isSyncing = false;
+    logger.timeEnd("sync");
+    logger.groupEnd();
   }
-
-  // Remove successful logs from buffer
-  if (successfulIndices.length > 0) {
-    // We need to be careful removing items by index from an array we iterated
-    // best way is to keep items that were NOT successful
-    const successfulSet = new Set(successfulIndices);
-    const remainingLogs = logs.filter((_, index) => !successfulSet.has(index));
-
-    await saveLogsToStorage(remainingLogs);
-    await refreshBadge();
-
-    logger.info("Sync batch completed", {
-      synced: successfulIndices.length,
-      remaining: remainingLogs.length,
-    });
-  }
-
-  logger.timeEnd("sync");
-  logger.groupEnd();
 }
 
 /**
@@ -431,6 +527,21 @@ function scheduleRetry(attempt) {
  */
 async function forceSync() {
   logger.info("Force sync triggered");
+
+  // 1. Flush the current in-memory session to storage first!
+  // This ensures the current active tab's duration is captured before we sync.
+  await handleTabChange(null);
+
+  // 2. Restart tracking immediately for the active tab (so the user doesn't lose tracking while syncing)
+  // We do this BEFORE sync because sync might take time.
+  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (tabs.length > 0) {
+    // We "fake" a tab change to the same tab to restart the timer
+    lastActiveTime = Date.now();
+    handleTabChange(tabs[0].id);
+  }
+
+  // 3. Now perform the sync (which will include the just-flushed log)
   await syncLogs(0);
 }
 

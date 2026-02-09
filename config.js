@@ -4,7 +4,7 @@
 
 // --- ENVIRONMENT ---
 // Set to 'production' when deploying to Chrome Web Store
-const ENV = "development"; // 'development' or 'production'
+const ENV = "production"; // 'development' or 'production'
 
 // --- API Configuration ---
 const API_CONFIG = {
