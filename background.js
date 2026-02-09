@@ -38,7 +38,7 @@ import {
 // ============================================
 let currentTabId = null;
 let currentUrl = "";
-let startTime = Date.now();
+let lastActiveTime = Date.now();
 let currentMetadata = { title: "", description: "" };
 let syncRetryCount = 0;
 let errorCount = 0;
@@ -94,7 +94,30 @@ function scrapePageContext() {
  */
 async function handleTabChange(newTabId) {
   const now = Date.now();
-  const duration = (now - startTime) / 1000;
+  let newTab = null;
+
+  // Pre-fetch new tab info to check for duplicates
+  if (newTabId) {
+    try {
+      newTab = await chrome.tabs.get(newTabId);
+    } catch (e) {
+      // Tab might be missing/closed, proceed without it
+    }
+  }
+
+  // Check if we are still on the same URL (e.g. spurious onUpdated event)
+  if (
+    newTabId &&
+    currentTabId === newTabId &&
+    newTab &&
+    newTab.url === currentUrl
+  ) {
+    // We can update metadata here if we want, but definitely do NOT reset the timer
+    logger.debug("Ignored duplicate tab update", { url: currentUrl });
+    return;
+  }
+
+  const duration = (now - lastActiveTime) / 1000;
 
   logger.debug("Tab change detected", {
     previousTab: currentTabId,
@@ -113,7 +136,7 @@ async function handleTabChange(newTabId) {
         domain: domain,
         title: sanitizeText(currentMetadata.title, 200),
         description: sanitizeText(currentMetadata.description, 500),
-        startTime: startTime,
+        startTime: lastActiveTime,
         endTime: now,
         duration: Math.round(duration),
         timestamp: new Date().toISOString(),
@@ -126,7 +149,7 @@ async function handleTabChange(newTabId) {
   }
 
   // B. PREPARE NEW SESSION
-  startTime = now;
+  lastActiveTime = now;
   currentMetadata = { title: "", description: "" };
 
   if (!newTabId) {
@@ -136,7 +159,8 @@ async function handleTabChange(newTabId) {
   }
 
   try {
-    const tab = await chrome.tabs.get(newTabId);
+    // Use the already fetched tab if available
+    const tab = newTab || (await chrome.tabs.get(newTabId));
 
     if (tab.active && tab.url && !isSystemUrl(tab.url)) {
       const domain = extractDomain(tab.url);
@@ -237,7 +261,7 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
       lastFocusedWindow: true,
     });
     if (tabs.length > 0) {
-      startTime = Date.now();
+      lastActiveTime = Date.now();
       debouncedTabChange(tabs[0].id);
     }
   }
@@ -252,7 +276,7 @@ chrome.idle.onStateChanged.addListener(async (state) => {
   } else if (state === "active") {
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tabs.length > 0) {
-      startTime = Date.now();
+      lastActiveTime = Date.now();
       debouncedTabChange(tabs[0].id);
     }
   }
