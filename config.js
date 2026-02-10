@@ -4,7 +4,7 @@
 
 // --- ENVIRONMENT ---
 // Set to 'production' when deploying to Chrome Web Store
-const ENV = "production"; // 'development' or 'production'
+const ENV = "development"; // 'development' or 'production'
 
 // --- API Configuration ---
 const API_CONFIG = {
@@ -17,7 +17,7 @@ export const API_URL = API_CONFIG[ENV];
 // --- Timing Constants ---
 export const IDLE_THRESHOLD = 360; // Seconds before user considered idle
 export const MIN_DURATION = 5; // Ignore visits shorter than this (seconds)
-export const SYNC_INTERVAL = 15; // Minutes between API syncs
+export const SYNC_INTERVAL = 1; // Minutes between API syncs
 export const DEBOUNCE_MS = 500; // Debounce rapid tab switches
 export const HEALTH_PING_INTERVAL = 1440; // 24 hours in minutes
 

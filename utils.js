@@ -10,6 +10,7 @@ import {
   PURGE_PERCENTAGE,
 } from "./config.js";
 import logger from "./logger.js";
+import { getEntries } from "./bufferManager.js";
 
 // ============================================
 // CACHED CUSTOM SETTINGS
@@ -229,85 +230,6 @@ export async function checkAndPurgeStorage() {
   }
 }
 
-/**
- * Get logs from storage (FIFO order)
- * @returns {Promise<Array>}
- */
-export async function getLogsFromStorage() {
-  const data = await chrome.storage.local.get("logs");
-  return data.logs || [];
-}
-
-/**
- * Save logs to storage
- * @param {Array} logs - Logs array
- */
-export async function saveLogsToStorage(logs) {
-  await chrome.storage.local.set({ logs });
-}
-
-/**
- * Add a single log entry to storage
- * @param {Object} log - Log entry
- */
-export async function appendLogToStorage(log) {
-  const logs = await getLogsFromStorage();
-
-  try {
-    // If an entry for the same URL already exists in the buffer, merge durations
-    const idx = logs.findIndex((l) => l.url === log.url);
-
-    if (idx !== -1) {
-      const existing = logs[idx];
-
-      // Sum durations
-      existing.duration =
-        (Number(existing.duration) || 0) + (Number(log.duration) || 0);
-
-      // Preserve earliest startTime and latest endTime
-      if (
-        log.startTime &&
-        (!existing.startTime || log.startTime < existing.startTime)
-      ) {
-        existing.startTime = log.startTime;
-      }
-      if (
-        log.endTime &&
-        (!existing.endTime || log.endTime > existing.endTime)
-      ) {
-        existing.endTime = log.endTime;
-      }
-
-      // Update timestamp to now and prefer more descriptive title/description
-      existing.timestamp = new Date().toISOString();
-      if (!existing.title && log.title) existing.title = log.title;
-      if (!existing.description && log.description)
-        existing.description = log.description;
-
-      logs[idx] = existing;
-    } else {
-      logs.push(log);
-    }
-
-    await saveLogsToStorage(logs);
-    return logs.length;
-  } catch (e) {
-    logger.error("Failed to append or merge log", { error: e.message });
-    // Fallback: try to push and save the log
-    logs.push(log);
-    await saveLogsToStorage(logs);
-    return logs.length;
-  }
-}
-
-/**
- * Clear all logs from storage
- */
-export async function clearLogsFromStorage() {
-  await chrome.storage.local.set({ logs: [] });
-  logger.info("Logs cleared from storage");
-}
-
 // ============================================
 // NETWORK UTILITIES
 // ============================================
@@ -354,7 +276,7 @@ export async function updateBadge(count) {
  * Refresh badge from storage
  */
 export async function refreshBadge() {
-  const logs = await getLogsFromStorage();
+  const logs = await getEntries();
   await updateBadge(logs.length);
 }
 

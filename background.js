@@ -1,275 +1,50 @@
 // ============================================
 // BACKGROUND.JS - The Logger Chrome Extension
-// Production-Ready Service Worker
+// Production-Ready Service Worker (Modular)
 // ============================================
 
-import {
-  API_URL,
-  IDLE_THRESHOLD,
-  MIN_DURATION,
-  SYNC_INTERVAL,
-  DEBOUNCE_MS,
-  HEALTH_PING_INTERVAL,
-  IS_DEV,
-} from "./config.js";
-
+import { IDLE_THRESHOLD, IS_DEV, HEALTH_PING_INTERVAL } from "./config.js";
 import logger from "./logger.js";
-
-import {
-  isSystemUrl,
-  isBlacklistedDomain,
-  redactSensitiveUrl,
-  extractDomain,
-  sanitizeText,
-  debounce,
-  checkAndPurgeStorage,
-  getLogsFromStorage,
-  saveLogsToStorage,
-  appendLogToStorage,
-  isOnline,
-  calculateBackoff,
-  refreshBadge,
-  loadCustomSettings,
-  getClientId,
-} from "./utils.js";
+import { debounce, loadCustomSettings, refreshBadge } from "./utils.js";
+import * as sessionTracker from "./sessionTracker.js";
+import * as syncManager from "./syncManager.js";
+import { getEntries } from "./bufferManager.js";
+import { API_URL } from "./config.js";
+import { isOnline } from "./utils.js";
 
 // ============================================
-// STATE
+// INITIALIZATION
 // ============================================
-let currentTabId = null;
-let currentUrl = "";
-let lastActiveTime = Date.now();
-let currentMetadata = { title: "", description: "" };
-let isSyncing = false; // Prevent concurrent syncs
-let syncRetryCount = 0;
-let errorCount = 0;
 
 // Set up idle detection
 chrome.idle.setDetectionInterval(IDLE_THRESHOLD);
 
-// ============================================
-// 1. CONTENT SCRAPER (Injected into pages)
-// ============================================
+// Load custom settings on startup
+loadCustomSettings();
 
-/**
- * This function runs INSIDE the webpage context
- * Uses requestIdleCallback for lazy execution
- */
-function scrapePageContext() {
-  return new Promise((resolve) => {
-    const doScrape = () => {
-      try {
-        const getMeta = (name) => {
-          const el =
-            document.querySelector(`meta[name="${name}"]`) ||
-            document.querySelector(`meta[property="${name}"]`);
-          return el ? el.content : "";
-        };
+// Refresh badge on startup
+refreshBadge();
 
-        resolve({
-          title: document.title || window.location.hostname,
-          description:
-            getMeta("description") || getMeta("og:description") || "",
-        });
-      } catch (e) {
-        resolve({ title: "", description: "" });
-      }
-    };
+// Set up sync alarms
+syncManager.setupAlarms();
 
-    // Use requestIdleCallback if available for lazy execution
-    if ("requestIdleCallback" in window) {
-      requestIdleCallback(doScrape, { timeout: 2000 });
-    } else {
-      setTimeout(doScrape, 100);
-    }
-  });
-}
+// Set up health ping alarm
+chrome.alarms.create("healthPing", { periodInMinutes: HEALTH_PING_INTERVAL });
+
+logger.info("Background service worker initialized", {
+  version: chrome.runtime.getManifest().version,
+  apiUrl: API_URL,
+  isDev: IS_DEV,
+});
 
 // ============================================
-// 2. CORE TRACKING LOGIC
+// EVENT LISTENERS - TABS
 // ============================================
-
-/**
- * Handle tab change - saves previous session, starts new one
- * @param {number|null} newTabId - New tab ID or null to just save
- */
-async function handleTabChange(newTabId) {
-  const now = Date.now();
-  let newTab = null;
-
-  // Pre-fetch new tab info to check for duplicates
-  if (newTabId) {
-    try {
-      newTab = await chrome.tabs.get(newTabId);
-    } catch (e) {
-      // Tab might be missing/closed, proceed without it
-    }
-  }
-
-  // Check if we are still on the same URL (e.g. spurious onUpdated event)
-  let isSameSession = false;
-  if (newTabId && currentTabId === newTabId && newTab) {
-    if (newTab.url === currentUrl) {
-      isSameSession = true;
-    } else if (
-      currentUrl &&
-      currentUrl.includes("youtube.com/watch") &&
-      newTab.url.includes("youtube.com/watch")
-    ) {
-      // Smart check for YouTube: same video ID means same session
-      try {
-        const u1 = new URL(currentUrl);
-        const u2 = new URL(newTab.url);
-        if (u1.searchParams.get("v") === u2.searchParams.get("v")) {
-          isSameSession = true;
-        }
-      } catch (e) {}
-    }
-  }
-
-  if (isSameSession) {
-    // We can update metadata here if we want, but definitely do NOT reset the timer
-    logger.debug("Same session update - refreshing metadata", {
-      url: currentUrl,
-    });
-
-    // If the page has finished loading, try to grab better metadata (title/desc)
-    if (newTab && newTab.status === "complete") {
-      try {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: newTabId },
-          func: scrapePageContext,
-        });
-
-        if (results?.[0]?.result && results[0].result.title) {
-          currentMetadata = results[0].result;
-        }
-      } catch (err) {
-        /* ignore injection errors on same-session updates */
-      }
-    }
-    return;
-  }
-
-  const duration = (now - lastActiveTime) / 1000;
-
-  logger.debug("Tab change detected", {
-    previousTab: currentTabId,
-    newTab: newTabId,
-    duration: Math.round(duration),
-  });
-
-  // A. LOG PREVIOUS SESSION
-  if (currentUrl && duration > MIN_DURATION && currentUrl.startsWith("http")) {
-    const domain = extractDomain(currentUrl);
-
-    // Check blacklist
-    if (!isBlacklistedDomain(domain)) {
-      const logEntry = {
-        url: redactSensitiveUrl(currentUrl),
-        domain: domain,
-        title: sanitizeText(currentMetadata.title, 200),
-        description: sanitizeText(currentMetadata.description, 500),
-        startTime: lastActiveTime,
-        endTime: now,
-        duration: Math.round(duration),
-        timestamp: new Date().toISOString(),
-      };
-
-      await saveToBuffer(logEntry);
-    } else {
-      logger.debug("Skipped blacklisted domain", { domain });
-    }
-  }
-
-  // B. PREPARE NEW SESSION
-  lastActiveTime = now;
-  currentMetadata = { title: "", description: "" };
-
-  if (!newTabId) {
-    currentUrl = "";
-    currentTabId = null;
-    return;
-  }
-
-  try {
-    // Use the already fetched tab if available
-    const tab = newTab || (await chrome.tabs.get(newTabId));
-
-    if (tab.active && tab.url && !isSystemUrl(tab.url)) {
-      const domain = extractDomain(tab.url);
-
-      // Skip blacklisted domains entirely
-      if (isBlacklistedDomain(domain)) {
-        logger.debug("New tab is blacklisted, not tracking", { domain });
-        currentUrl = "";
-        currentTabId = null;
-        return;
-      }
-
-      currentUrl = tab.url;
-      currentTabId = newTabId;
-
-      // C. SCRAPE PAGE CONTEXT
-      try {
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: newTabId },
-          func: scrapePageContext,
-        });
-
-        if (results?.[0]?.result) {
-          currentMetadata = results[0].result;
-          logger.info("Captured context", {
-            title: currentMetadata.title?.substring(0, 50),
-          });
-        }
-      } catch (err) {
-        // Script injection fails on restricted pages
-        currentMetadata = { title: tab.title || "", description: "" };
-        logger.debug("Scrape fallback to tab.title", { error: err.message });
-      }
-    } else {
-      currentUrl = "";
-      currentTabId = null;
-    }
-  } catch (e) {
-    logger.warn("Failed to get tab info", { error: e.message });
-    currentUrl = "";
-    currentTabId = null;
-  }
-}
 
 /**
  * Debounced version of handleTabChange for rapid switches
  */
-const debouncedTabChange = debounce(handleTabChange, DEBOUNCE_MS);
-
-/**
- * Save log entry to local buffer
- * @param {Object} log - Log entry
- */
-async function saveToBuffer(log) {
-  try {
-    // Check storage quota before saving
-    await checkAndPurgeStorage();
-
-    const count = await appendLogToStorage(log);
-    await refreshBadge();
-
-    logger.info("Buffered log", {
-      domain: log.domain,
-      duration: log.duration,
-      bufferSize: count,
-    });
-  } catch (e) {
-    logger.error("Failed to save to buffer", { error: e.message });
-    errorCount++;
-  }
-}
-
-// ============================================
-// 3. EVENT LISTENERS
-// ============================================
+const debouncedTabChange = debounce(sessionTracker.handleTabChange, 500);
 
 // Tab activated (switched tabs)
 chrome.tabs.onActivated.addListener((activeInfo) => {
@@ -286,17 +61,22 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
 
 // Tab removed (closed)
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-  if (tabId === currentTabId) {
+  const currentSession = sessionTracker.getCurrentSession();
+  if (tabId === currentSession.tabId) {
     // Pass null to signal that the active session has ended
-    handleTabChange(null);
+    sessionTracker.handleTabChange(null);
   }
 });
+
+// ============================================
+// EVENT LISTENERS - WINDOWS
+// ============================================
 
 // Window focus changed
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
     // User left Chrome - save pending log immediately (no debounce)
-    await handleTabChange(null);
+    await sessionTracker.endSession();
   } else {
     // User came back
     const tabs = await chrome.tabs.query({
@@ -304,11 +84,14 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
       lastFocusedWindow: true,
     });
     if (tabs.length > 0) {
-      lastActiveTime = Date.now();
       debouncedTabChange(tabs[0].id);
     }
   }
 });
+
+// ============================================
+// EVENT LISTENERS - IDLE
+// ============================================
 
 // Idle state changed
 chrome.idle.onStateChanged.addListener(async (state) => {
@@ -316,10 +99,12 @@ chrome.idle.onStateChanged.addListener(async (state) => {
 
   if (state === "idle" || state === "locked") {
     // Check if the current tab is playing audio (e.g. YouTube)
+    const currentSession = sessionTracker.getCurrentSession();
     let isAudible = false;
-    if (currentTabId) {
+
+    if (currentSession.tabId) {
       try {
-        const tab = await chrome.tabs.get(currentTabId);
+        const tab = await chrome.tabs.get(currentSession.tabId);
         if (tab && tab.audible) {
           isAudible = true;
         }
@@ -333,268 +118,44 @@ chrome.idle.onStateChanged.addListener(async (state) => {
       return;
     }
 
-    await handleTabChange(null);
+    await sessionTracker.endSession();
   } else if (state === "active") {
-    // If we're already tracking a valid session (e.g. continued through idle), don't reset
-    if (currentUrl && currentTabId) {
+    // If we're already tracking a valid session, don't reset
+    const currentSession = sessionTracker.getCurrentSession();
+    if (currentSession.url && currentSession.tabId) {
       logger.debug("User active again - continuing session");
       return;
     }
 
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tabs.length > 0) {
-      lastActiveTime = Date.now();
-      debouncedTabChange(tabs[0].id);
+      await sessionTracker.startSession(tabs[0].id);
     }
   }
 });
 
 // ============================================
-// 4. SERVER SYNC (Offline-First with Retry)
+// EVENT LISTENERS - ALARMS
 // ============================================
-
-// Create sync alarm
-chrome.alarms.create("syncData", { periodInMinutes: SYNC_INTERVAL });
-
-// Create daily health ping alarm
-chrome.alarms.create("healthPing", { periodInMinutes: HEALTH_PING_INTERVAL });
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name === "syncData") {
-    // 1. Flush the current in-memory session to storage first!
-    // This allows long-running sessions (like videos) to be synced incrementally
-    await handleTabChange(null);
-
-    // 2. Restart tracking immediately for the active tab
-    // We do this BEFORE sync so we don't lose time
-    const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tabs.length > 0) {
-      lastActiveTime = Date.now();
-      handleTabChange(tabs[0].id);
-    }
-
-    // 3. Perform Sync
-    await syncLogs();
+  if (alarm.name === "sessionChunk") {
+    await syncManager.handleSessionChunkAlarm();
+  } else if (alarm.name === "syncData") {
+    await syncManager.syncLogs();
   } else if (alarm.name === "healthPing") {
-    await sendHealthPing();
+    await syncManager.sendHealthPing();
   }
 });
 
-/**
- * Sync logs to server with exponential backoff
- * @param {number} retryAttempt - Current retry attempt
- */
-async function syncLogs(retryAttempt = 0) {
-  // Check network status first
-  if (!isOnline()) {
-    logger.warn("Offline - skipping sync");
-    return;
-  }
-
-  // Prevent concurrent syncs
-  if (isSyncing) {
-    logger.debug("Sync already in progress - skipping");
-    return;
-  }
-
-  const data = await chrome.storage.local.get(["logs", "apiKey"]);
-  const logs = data.logs || [];
-  const apiKey = data.apiKey;
-
-  if (logs.length === 0) {
-    logger.debug("No logs to sync");
-    return;
-  }
-
-  if (!apiKey) {
-    logger.warn("No API key configured");
-    return;
-  }
-
-  try {
-    isSyncing = true;
-    logger.group("Sync Operation");
-    logger.time("sync");
-
-    const clientId = await getClientId();
-    const successfulIndices = [];
-    let abortSync = false;
-
-    for (let i = 0; i < logs.length; i++) {
-      if (abortSync) break;
-
-      const log = logs[i];
-
-      // Transform to production schema
-      const payload = {
-        url: log.url,
-        title: log.title || "Untitled",
-        duration: log.duration,
-        timestamp: log.timestamp || new Date(log.startTime).toISOString(),
-        description: log.description || "",
-        source: {
-          type: "chrome-extension",
-          deviceName: "Chrome Extension",
-          clientId: clientId,
-        },
-      };
-
-      try {
-        const response = await fetch(`${API_URL}/api/log`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${apiKey}`,
-          },
-          body: JSON.stringify(payload),
-        });
-
-        if (response.ok) {
-          successfulIndices.push(i);
-          logger.debug("Synced log", { title: payload.title });
-          syncRetryCount = 0; // Reset retry on success
-        } else if (response.status === 429 || response.status >= 500) {
-          // Temporary failure - stop syncing and retry later
-          logger.warn("Sync paused (server issue)", {
-            status: response.status,
-          });
-          scheduleRetry(retryAttempt);
-          abortSync = true;
-        } else {
-          // Permanent failure (400/401) - log error but don't retry this item
-          // We'll treat it as "handled" so it gets removed from buffer to prevent clogging
-          logger.error("Log rejected", {
-            status: response.status,
-            url: payload.url,
-          });
-          errorCount++;
-          successfulIndices.push(i); // Remove bad logs to clear queue
-        }
-      } catch (error) {
-        // Network error - stop syncing
-        logger.error("Sync failed", { error: error.message });
-        scheduleRetry(retryAttempt);
-        abortSync = true;
-        errorCount++;
-      }
-    }
-
-    // Remove successful logs from buffer
-    if (successfulIndices.length > 0) {
-      // We need to be careful removing items by index from an array we iterated
-      // best way is to keep items that were NOT successful
-      const successfulSet = new Set(successfulIndices);
-      const remainingLogs = logs.filter(
-        (_, index) => !successfulSet.has(index),
-      );
-
-      await saveLogsToStorage(remainingLogs);
-      await refreshBadge();
-
-      logger.info("Sync batch completed", {
-        synced: successfulIndices.length,
-        remaining: remainingLogs.length,
-      });
-    }
-  } catch (error) {
-    logger.error("Sync process failed", { error: error.message });
-  } finally {
-    isSyncing = false;
-    logger.timeEnd("sync");
-    logger.groupEnd();
-  }
-}
-
-/**
- * Schedule a sync retry with exponential backoff
- * @param {number} attempt - Current attempt number
- */
-function scheduleRetry(attempt) {
-  const delay = calculateBackoff(attempt);
-  const nextAttempt = attempt + 1;
-
-  logger.info("Scheduling retry", {
-    attempt: nextAttempt,
-    delayMs: delay,
-  });
-
-  setTimeout(() => syncLogs(nextAttempt), delay);
-  syncRetryCount = nextAttempt;
-}
-
-/**
- * Force sync (called from popup)
- */
-async function forceSync() {
-  logger.info("Force sync triggered");
-
-  // 1. Flush the current in-memory session to storage first!
-  // This ensures the current active tab's duration is captured before we sync.
-  await handleTabChange(null);
-
-  // 2. Restart tracking immediately for the active tab (so the user doesn't lose tracking while syncing)
-  // We do this BEFORE sync because sync might take time.
-  const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tabs.length > 0) {
-    // We "fake" a tab change to the same tab to restart the timer
-    lastActiveTime = Date.now();
-    handleTabChange(tabs[0].id);
-  }
-
-  // 3. Now perform the sync (which will include the just-flushed log)
-  await syncLogs(0);
-}
-
 // ============================================
-// 5. HEALTH PING (Telemetry)
-// ============================================
-
-/**
- * Send daily health ping to server
- */
-async function sendHealthPing() {
-  if (!isOnline()) return;
-
-  const data = await chrome.storage.local.get("apiKey");
-  if (!data.apiKey) return;
-
-  try {
-    const platformInfo = await chrome.runtime.getPlatformInfo();
-    const manifest = chrome.runtime.getManifest();
-
-    const payload = {
-      extensionVersion: manifest.version,
-      platform: platformInfo.os,
-      arch: platformInfo.arch,
-      errorsEncountered: errorCount,
-      timestamp: new Date().toISOString(),
-    };
-
-    await fetch(`${API_URL}/api/health`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${data.apiKey}`,
-      },
-      body: JSON.stringify(payload),
-    });
-
-    logger.info("Health ping sent", payload);
-
-    // Reset error count after successful ping
-    errorCount = 0;
-  } catch (e) {
-    logger.warn("Health ping failed", { error: e.message });
-  }
-}
-
-// ============================================
-// 6. MESSAGE HANDLERS (For Popup Communication)
+// MESSAGE HANDLERS (For Popup Communication)
 // ============================================
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === "forceSync") {
-    forceSync()
+    syncManager
+      .forceSync()
       .then(() => {
         sendResponse({ success: true });
       })
@@ -606,11 +167,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "getStatus") {
     chrome.storage.local.get(["logs", "apiKey"]).then((data) => {
+      const syncStatus = syncManager.getSyncStatus();
       sendResponse({
         hasApiKey: !!data.apiKey,
         logCount: data.logs?.length || 0,
         isOnline: isOnline(),
-        syncRetryCount: syncRetryCount,
+        syncRetryCount: syncStatus.syncRetryCount,
       });
     });
     return true;
@@ -659,19 +221,3 @@ async function checkApiConnection(apiKey) {
     return { connected: false, error: e.message };
   }
 }
-
-// ============================================
-// 7. INITIALIZATION
-// ============================================
-
-// Load custom settings on startup
-loadCustomSettings();
-
-// Refresh badge on startup
-refreshBadge();
-
-logger.info("Background service worker initialized", {
-  version: chrome.runtime.getManifest().version,
-  apiUrl: API_URL,
-  isDev: IS_DEV,
-});
